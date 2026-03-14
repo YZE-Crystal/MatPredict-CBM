@@ -1,0 +1,4 @@
+Metrics for Test Split:
+MAE:  0.4746
+RMSE: 0.7193
+R2:   0.8877

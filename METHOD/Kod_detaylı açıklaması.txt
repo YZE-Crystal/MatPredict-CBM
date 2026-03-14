@@ -1,0 +1,46 @@
+CBM Predictor v2 — Pipeline Metodolojisi
+Genel Bakış
+Model, kristal malzemelerin Conduction Band Minimum (CBM) değerini .cif uzantılı kristal yapı dosyalarından tahmin eder. Üç farklı bilgi kaynağını paralel olarak işleyip birleştiren bir multi-branch deep learning mimarisi kullanır.
+
+ADIM 1 — Veri Yükleme ve Ön Filtreleme
+Girdi: labels.csv (filename + cbm sütunları), CIF dosya dizini, opsiyonel MEGNet embedding CSV'si.
+main() fonksiyonu CSV'yi okur ve isteğe bağlı olarak --max_samples parametresiyle rastgele alt örnekleme yapar. CBM değerleri [-10, 10] eV aralığının dışındaki satırlar aykırı değer olarak build_cache aşamasında elenir. MEGNet embedding CSV'si verilmişse load_megnet_embeddings() ile yüklenir: 16-boyutlu ham vektörler StandardScaler ile normalize edilir, [-3, 3] aralığına kırpılır ve material_id → numpy array sözlüğüne alınır. Embedding CSV verilmezse o branch sıfır vektörle çalışmaya devam eder.
+
+ADIM 2 — Özellik Çıkarımı ve Disk Cache Oluşturma
+Bu adım hesaplama açısından en ağır kısımdır ve her malzeme için bir kez yapılıp .pt dosyası olarak diske kaydedilir. Cache versiyonu cache_version.txt ile takip edilir; v1 cache v2 ile uyumsuzdur çünkü edge feature boyutu değişmiştir.
+2a. Node Features — Element Özellikleri
+Her atom için 7 fiziksel özellik pymatgen.Element API'sinden çekilir: atomic_mass, atomic_radius, electronegativity (X), ionization_energy, electron_affinity, row, group. Her özellik manuel olarak belirlenmiş (μ, σ) çiftleriyle z-score normalize edilir ve [-3, 3] aralığına kırpılır. Sonuç (N_atom, 7) boyutlu bir tensördür.
+2b. Edge Features — Gaussian RBF Encoding
+pymatgen ile CUTOFF_RADIUS=6.0 Å içindeki komşulara bakılır, her atom için en yakın MAX_NEIGHBORS=12 komşu seçilir. v1'deki 4-dim sabit encoding ([d, 1/(d+ε), d², exp(-d/2)]) yerine v2'de 16 Gaussian RBF kullanılır:
+f_k(d) = exp(−γ · (d/r_cut − c_k)²)
+c_k değerleri [0, 1] aralığında eşit aralıklı 16 merkezdir, γ = (16/2)² = 64. Bu encoding, mesafeyi sürekli ve zengin biçimde temsil eder; her komşu için (16,) boyutlu bir vektör üretilir. Tüm graf torch_geometric.data.Data nesnesi olarak tutulur: x (N,7), edge_index (2,E), edge_attr (E,16).
+2c. TDA Features — Topolojik Veri Analizi
+Kristal yapının Kartezyen koordinatları alınır. Atom sayısı 150'yi aşarsa rastgele alt örnekleme yapılır. ripser kütüphanesiyle Vietoris-Rips kompleksi üzerinde 0. ve 1. boyutta persistent homology hesaplanır (eşik: 8 Å). Her boyut için ölüm-doğum farkları (lifetime) histogram binlerine dönüştürülür (TDA_BINS=16). İki histogram birleştirilerek (32,) boyutlu bir vektör elde edilir. Bu vektör, malzemenin bağlantısallık ve döngü topolojisini özetler.
+2d. Cache Kaydetme
+Her malzeme için graph.cbm, graph.tda, graph.megnet, graph.filename alanları atanarak tek bir .pt dosyasına kaydedilir. Sonraki çalıştırmalarda bu adım tamamen atlanır.
+
+ADIM 3 — Dataset ve TDA Normalizasyonu
+Geçerli cache dosyaları listelenir ve train/val/test olarak bölünür (sklearn.train_test_split, iki aşamalı: önce test ayrılır, ardından kalan train/val'e bölünür). TDA vektörleri eğitim setinin ilk 5000 örneği üzerinde StandardScaler ile fit edilir ve cache_dir/tda_scaler.pkl olarak kaydedilir. CIFCacheDataset.__getitem__ her erişimde TDA'yı bu scaler ile dönüştürür ve [-5, 5] aralığına kırpar. Tüm tensorlarda NaN/Inf kontrolü yapılır.
+
+ADIM 4 — Model Mimarisi
+4a. GNN Branch — Kristal Graf Encoder
+GNNEncoder sınıfı, Crystal Graph Convolutional Network yaklaşımını 6 katmanlı hale genişletir. Giriş projeksiyonu (7 → 256) boyutundadır. Her katmanda CGConv (Crystal Graph Convolution) uygulanır; bu operasyon komşu atom özelliklerini edge feature'larla birleştirerek mesaj geçişi yapar. Her katmanın çıktısına residual bağlantı ve LayerNorm uygulanır, ardından %10 dropout gelir. 6 katman boyunca hidden=256 sabit tutulur. Son olarak global_mean_pool ile tüm atomların ortalaması alınır ve (256 → 192) projeksiyonla z_gnn ∈ ℝ^192 üretilir.
+4b. TDA Branch — Topolojik Projeksiyon
+TDAProjector, (32 → 256 → 256 → 128) boyutlu 3 katmanlı bir MLP'dir. SiLU aktivasyonu, LayerNorm ve %10 dropout kullanılır. v1'e kıyasla ara boyut iki katına çıkarılmış ve ekstra bir katman eklenmiştir. Çıktı: z_tda ∈ ℝ^128.
+4c. MEGNet Branch — Embedding Projeksiyonu
+MEGNetProjector, (16 → 128 → 128 → 64) boyutlu benzer bir MLP'dir. Xavier initialization ile gain=0.5 kullanılır (embedding sinyalinin aşırı büyümesini önlemek için). Çıktı: z_meg ∈ ℝ^64.
+4d. Fusion ve CPPN Head
+Üç branch çıktısı birleştirilir: z = LayerNorm([z_gnn ∥ z_tda ∥ z_meg]) ∈ ℝ^384.
+Bu fused vektör Compositional Pattern Producing Network (CPPN) head'e verilir. K=6 mixture modeli şu şekilde çalışır: Her k için bir gate (softmax normalizedğ), bir lineer branch, bir kuadratik branch (poly_q1 → SiLU → poly_q2) ve v2'ye özgü bir cubic branch (poly_c1 → SiLU → (.²) → poly_c2) hesaplanır. Final tahmin: ŷ = Σₖ gate_k · (lin_k + quad_k + cubic_k). Bu yapı, farklı malzeme gruplarına farklı polinomik tepkiler vermesini sağlar.
+
+ADIM 5 — Eğitim Stratejisi
+Loss fonksiyonu: Huber loss (δ=0.5) — MSE'ye kıyasla aykırı değerlere daha dayanıklıdır; küçük hatalar için kuadratik, büyük hatalar için lineer davranır.
+Regularizasyon: Gradient norm penalty, CPPN head'in gradient_penalty() metoduyla hesaplanır. z'nin gradienti retain edilerek ‖∂ŷ/∂z‖² minimize edilir. v1'deki kritik hata olan z.detach() kaldırılmıştır; bu sayede penalty gerçekten backprop edilir ve head parametrelerini düzenler. Toplam loss: L = L_Huber + λ · ‖grad‖².
+Optimizer: AdamW (lr=3e-4, weight_decay=1e-5).
+LR Scheduler: OneCycleLR — ilk %10 epoch warmup (lr: max/10 → max), ardından cosine annealing ile max/1000'e iner. Bu v1'deki ayrı warmup+cosine stratejisinden daha agresif ve kararlıdır.
+Early stopping: 40 epoch sabrı, en iyi val_mae'de model kaydedilir.
+AMP: CUDA mevcutsa GradScaler ile mixed precision, ancak gradient_penalty float32 garanti altındadır.
+
+ADIM 6 — Değerlendirme ve Çıktılar
+evaluate() fonksiyonu @torch.no_grad() altında tüm split'leri tahmin eder. NaN filtresi ile geçersiz tahminler elenir. Metrikler: MAE (eV) ve R². v1 bug fix: predictions.csv'deki filename sütunu artık evaluate()'ten dönen gerçek dosya adlarını kullanır, valid_fnames listesini değil — bu, NaN filtresi sonrası index kaymasını önler.
+Son çıktılar: predictions.csv (filename, cbm_true, cbm_pred, error, split), training_log_v2.csv (her epoch için loss/mae/r2/lr), model_v2.pt (son ağırlıklar), model_best_v2.pt (en iyi val_mae ağırlıkları).
