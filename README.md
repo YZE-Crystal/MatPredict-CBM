@@ -1,12 +1,11 @@
-# CBM Predictor v2
+# MatPredict-CBM
 
 ## Overview
-CBM Predictor v2 is a multi-branch deep learning pipeline that predicts the Conduction Band Minimum (CBM) of crystal materials from `.cif` files. It processes three distinct information sources in parallel to make highly accurate predictions within the [-10, 10] eV range.
+MatPredict-CBM is a multi-branch deep learning pipeline that predicts the Conduction Band Minimum (CBM) of crystal materials from `.cif` files. It processes three distinct information sources in parallel to make highly accurate predictions within the [-10, 10] eV range.
 
 ## Core Architecture
 * **GNN Branch:** A 6-layer Crystal Graph Convolutional Network (CGConv) using 16 Gaussian RBF encodings for edge features.
 * **TDA Branch:** Uses topological data analysis (Vietoris-Rips complex) to extract 0th and 1st dimension persistent homology features.
-* **MEGNet Branch:** Processes optional pre-trained MEGNet embeddings.
 * **Fusion & CPPN Head:** Combines the branches into a 384-dimensional vector and passes it through a Compositional Pattern Producing Network (CPPN) with linear, quadratic, and cubic branches.
 
 ## Key Features
